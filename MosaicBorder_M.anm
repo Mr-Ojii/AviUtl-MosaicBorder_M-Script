@@ -1,0 +1,148 @@
+--track0:モザイク,1,500,10,1
+--track1:縁取り,0,500,20,1
+--track2:ぼかし,0,200,3,1
+--track3:合成度,-100,100,0,0.1
+--dialog:色/col,_1=0x808080;座標基準/chk,_2=0;単色化/chk,_3=1;アルファ/chk,_4=0;タイル風/chk,_5=0;モード,_6=0;PI,_0=nil;
+
+--[[
+  LuaJIT必須です
+
+  ## パラメータ説明
+  - モザイク :モザイクサイズ
+  - 縁取り   :縁取りサイズ
+  - ぼかし   :縁取りぼかしサイズ
+  - 合成度   :負の値で元画像の透明度変更、正の値で縁取りの透明度変更
+  - 色       :縁取りの色
+  - 座標基準 :モザイクを座標基準にするか
+  - 単色化   :縁取りにおいて元画像を単色化するか
+  - アルファ :アルファあり
+  - タイル風 :タイル風
+  - モード   :くり抜きに関するモード
+
+              0 = どちらもしない
+              1 = モザイク前のくり抜き
+              2 = モザイク後のくり抜き
+              3 = どちらもする
+
+              (内部では2進数でフラグ。今後追加する可能性あり)
+              1桁目: モザイク前のくり抜きあり
+              2桁目: モザイク後のくり抜きあり
+  - PI       :インジェクション用
+]]
+
+-- option
+_0 = _0 or {}
+local mossize = (_0[1] or obj.track0) or 10
+local borsize = (_0[2] or obj.track1) or 20
+local blursize = (_0[3] or obj.track2) or 3
+
+local col = _1 or 0x0000ff
+local boralp = math.max(0, 1 - ((_0[4] or obj.track3 or 0) / 100))
+local orgalp = math.max(0, 1 - (-(_0[4] or obj.track3 or 0) / 100))
+local prj = (_2 or 0) ~= 0
+local mono = (_3 or 0) ~= 0
+local alp = (_4 or 0) ~= 0
+local tile = (_5 or 0)
+
+-- ビット演算 (LuaJIT)
+local bit = require("bit")
+
+_6 = _6 or 0
+local kuri_before = bit.band(_6, 1) ~= 0
+local kuri_after = bit.band(_6, 2) ~= 0
+
+local essize = mossize + borsize
+--
+_0 = nil
+_1 = nil
+_2 = nil
+_3 = nil
+_4 = nil
+_5 = nil
+_6 = nil
+
+
+--FFI (LuaJIT)
+local ffi = require("ffi")
+pcall(ffi.cdef, [[
+  typedef struct Pixel_ {
+    uint8_t b,g,r,a;
+  } Pixel;
+]])
+--
+
+-- ボーダー出現分の領域拡張をしておく
+obj.effect("領域拡張", "上", essize, "下", essize, "左", essize, "右", essize)
+
+local w, h = obj.getpixel()
+obj.setoption("drawtarget", "tempbuffer", w, h)
+-- オリジナルのキャッシュをとっとく
+obj.copybuffer("cache:mob", "obj")
+if borsize ~= 0 then
+  obj.effect("縁取り", "サイズ", borsize, "ぼかし", blursize, "color", col)
+end
+
+-- モザイク前のくり抜き
+if kuri_before then
+  obj.draw()
+  obj.copybuffer("obj", "cache:mob")
+  obj.setoption("blend", 2)
+  obj.draw()
+  obj.setoption("blend", 0)
+  obj.copybuffer("obj", "tmp")
+  obj.setoption("drawtarget", "tempbuffer", w, h)
+end
+
+if mono then
+  obj.effect("単色化", "color", col, "輝度を保持する", 0, "強さ", 100)
+end
+
+-- 座標基準の時は、領域拡張をうまいことして、モザイク位置を調節
+-- 拡大率を考慮しながら、いい感じに領域を計算
+-- なんか間違ってるかも... (回転は知らん。オフスクリーン描画とか、シーンを使って)
+local zoom = obj.getvalue("zoom") / 100
+local at, ab, al, ar =  math.max(0, obj.y + obj.oy - obj.cy * zoom) / zoom % mossize * 2,
+                        math.max(0, - obj.y - obj.oy + obj.cy * zoom) / zoom % mossize * 2,
+                        math.max(0, obj.x + obj.ox - obj.cx * zoom) / zoom % mossize * 2,
+                        math.max(0, -obj.x - obj.ox + obj.cx * zoom) / zoom % mossize * 2
+if prj then
+  obj.effect("領域拡張", "上", at, "下", ab, "左", al, "右", ar)
+end
+
+obj.effect("モザイク", "サイズ", mossize, "タイル風", tile)
+
+-- 座標基準時の領域拡張分を削る
+if prj then
+  obj.effect("クリッピング", "上", at, "下", ab, "左", al, "右", ar)
+end
+
+-- アルファ値を二値化
+if not alp then
+  local w, h = obj.getpixel()
+  local data, _, _ = obj.getpixeldata()
+  local cdata = ffi.cast("Pixel*", data)
+  for i = 1, w * h do
+    cdata[i].a = math.ceil(cdata[i].a / 255) * 255
+  end
+  obj.putpixeldata(data)
+end
+obj.draw(0, 0, 0, 1, boralp)
+
+-- モザイク後のくり抜き
+if kuri_after then
+  obj.copybuffer("obj", "cache:mob")
+  if mono then
+    obj.effect("単色化", "color", col, "輝度を保持する", 0, "強さ", 100)
+  end
+  obj.setoption("blend", 2)
+  obj.draw()
+  obj.setoption("blend", 0)
+end
+
+-- キャッシュから戻して、上からオリジナルを描画
+obj.copybuffer("obj", "cache:mob")
+obj.draw(0, 0, 0, 1, orgalp)
+
+-- tempbufferをobjにコピーして終了
+obj.copybuffer("obj", "tmp")
+obj.setoption("drawtarget", "framebuffer")
